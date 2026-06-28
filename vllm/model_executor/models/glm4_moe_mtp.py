@@ -155,6 +155,19 @@ class Glm4MoeMultiTokenPredictor(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def set_skip_topk(self, skip: bool) -> None:
+        """Toggle skip_topk on all MTP sparse-attention layers."""
+        for layer in self.layers.values():
+            mtp_block = getattr(layer, "mtp_block", None)
+            if mtp_block is None:
+                continue
+            self_attn = getattr(mtp_block, "self_attn", None)
+            if self_attn is None:
+                continue
+            mla_attn = getattr(self_attn, "mla_attn", None)
+            if mla_attn is not None and hasattr(mla_attn, "skip_topk"):
+                mla_attn.skip_topk = skip
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -185,6 +198,19 @@ class Glm4MoeMultiTokenPredictor(nn.Module):
             mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states)
         )
         return logits
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Vocab-parallel argmax for the selected MTP step."""
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        return self.logits_processor.get_top_tokens(
+            mtp_layer.shared_head.head,
+            mtp_layer.shared_head(hidden_states),
+        )
 
 
 class Glm4MoeMTP(nn.Module, Glm4MixtureOfExperts):
@@ -252,6 +278,13 @@ class Glm4MoeMTP(nn.Module, Glm4MixtureOfExperts):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        return self.model.get_top_tokens(hidden_states, spec_step_idx)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [

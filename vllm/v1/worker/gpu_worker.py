@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A GPU worker class."""
 
+import ctypes
 import gc
 import os
 from collections.abc import Callable
@@ -79,6 +80,27 @@ from .gpu.warmup import warmup_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
+
+
+def _trim_after_model_load_if_enabled() -> None:
+    if os.getenv("VLLM_KZ_TRIM_AFTER_LOAD", "0") != "1":
+        return
+
+    gc.collect()
+    torch.accelerator.empty_cache()
+
+    malloc_trim_result: int | str = "not_run"
+    try:
+        malloc_trim_result = ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception as exc:
+        malloc_trim_result = f"failed:{exc}"
+
+    logger.info(
+        "VLLM_KZ_TRIM_AFTER_LOAD completed host=%s pid=%s malloc_trim=%s",
+        os.uname().nodename,
+        os.getpid(),
+        malloc_trim_result,
+    )
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -350,6 +372,11 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        print(
+            "KZ_LOAD_DIAG worker_load_model_enter "
+            f"rank={self.rank} local_rank={self.local_rank}",
+            flush=True,
+        )
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
@@ -357,6 +384,11 @@ class Worker(WorkerBase):
             self._scoped_allocator_max_split(max_split_size_mb=20),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        print(
+            "KZ_LOAD_DIAG worker_load_model_after_runner "
+            f"rank={self.rank} local_rank={self.local_rank}",
+            flush=True,
+        )
 
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
@@ -364,6 +396,8 @@ class Worker(WorkerBase):
                 self.vllm_config.parallel_config,
                 self.model_runner.get_model(),
             )
+
+        _trim_after_model_load_if_enabled()
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
@@ -472,6 +506,58 @@ class Worker(WorkerBase):
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
         )
+        if os.getenv("KZ_KV_DIAG", "0") == "1":
+            logger.info(
+                "KZ_KV_DIAG_WORKER_ENV host=%s pid=%s KZ_KV_DIAG=%s "
+                "VLLM_DCP_GLOBAL_TOPK=%s VLLM_DCP_SHARD_DRAFT=%s "
+                "VLLM_DCP_GLOBAL_TOPK_PREFILL_ONLY=%s "
+                "VLLM_DCP_TOPK_FORCE_DEEPGEMM=%s NCCL_IB_DISABLE=%s "
+                "NCCL_SOCKET_IFNAME=%s VLLM_HOST_IP=%s",
+                os.uname().nodename,
+                os.getpid(),
+                os.getenv("KZ_KV_DIAG"),
+                os.getenv("VLLM_DCP_GLOBAL_TOPK"),
+                os.getenv("VLLM_DCP_SHARD_DRAFT"),
+                os.getenv("VLLM_DCP_GLOBAL_TOPK_PREFILL_ONLY"),
+                os.getenv("VLLM_DCP_TOPK_FORCE_DEEPGEMM"),
+                os.getenv("NCCL_IB_DISABLE"),
+                os.getenv("NCCL_SOCKET_IFNAME"),
+                os.getenv("VLLM_HOST_IP"),
+            )
+            logger.info(
+                "KZ_KV_DIAG_MEMORY host=%s pid=%s init_free_bytes=%d "
+                "init_total_bytes=%d requested_memory_bytes=%d "
+                "gpu_memory_utilization=%.6f weights_memory_bytes=%d "
+                "non_torch_increase_bytes=%d torch_peak_increase_bytes=%d "
+                "non_kv_cache_memory_bytes=%d cudagraph_memory_estimate_bytes=%d "
+                "cudagraph_memory_estimate_applied_bytes=%d "
+                "after_profile_free_bytes=%d available_kv_cache_memory_bytes=%d "
+                "init_free_gib=%s requested_gib=%s weights_gib=%s "
+                "non_torch_gib=%s torch_peak_gib=%s non_kv_gib=%s "
+                "cudagraph_estimate_gib=%s available_kv_gib=%s",
+                os.uname().nodename,
+                os.getpid(),
+                self.init_snapshot.free_memory,
+                self.init_snapshot.total_memory,
+                self.requested_memory,
+                self.cache_config.gpu_memory_utilization,
+                profile_result.weights_memory,
+                profile_result.non_torch_increase,
+                profile_result.torch_peak_increase,
+                profile_result.non_kv_cache_memory,
+                cudagraph_memory_estimate,
+                cudagraph_memory_estimate_applied,
+                free_gpu_memory,
+                self.available_kv_cache_memory_bytes,
+                format_gib(self.init_snapshot.free_memory),
+                format_gib(self.requested_memory),
+                format_gib(profile_result.weights_memory),
+                format_gib(profile_result.non_torch_increase),
+                format_gib(profile_result.torch_peak_increase),
+                format_gib(profile_result.non_kv_cache_memory),
+                format_gib(cudagraph_memory_estimate),
+                format_gib(self.available_kv_cache_memory_bytes),
+            )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(

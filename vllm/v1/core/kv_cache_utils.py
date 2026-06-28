@@ -83,6 +83,128 @@ def maybe_convert_block_hash(hash_bytes: BlockHash) -> ExternalBlockHash:
 
 logger = init_logger(__name__)
 
+
+def _kz_kv_diag_enabled() -> bool:
+    return os.getenv("KZ_KV_DIAG", "0") == "1"
+
+
+def _kz_format_dtype(value: Any) -> str:
+    return str(value) if value is not None else "None"
+
+
+def _kz_spec_max_pages(vllm_config: VllmConfig, spec: KVCacheSpec) -> int:
+    page_size = getattr(spec, "page_size_bytes", 0)
+    if not page_size:
+        return 0
+    return cdiv(spec.max_memory_usage_bytes(vllm_config), page_size)
+
+
+def _kz_log_kv_specs(
+    vllm_config: VllmConfig,
+    label: str,
+    worker_idx: int | str,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> None:
+    if not _kz_kv_diag_enabled():
+        return
+    logger.info(
+        "KZ_KV_DIAG_PRE_GROUP label=%s worker=%s spec_count=%d",
+        label,
+        worker_idx,
+        len(kv_cache_spec),
+    )
+    for layer_name, spec in kv_cache_spec.items():
+        logger.info(
+            "KZ_KV_DIAG_SPEC label=%s worker=%s layer=%s spec_type=%s "
+            "block_size=%s page_size_bytes=%s head_size=%s dtype=%s "
+            "cache_dtype_str=%s dcp_replicated=%s max_memory_usage_bytes=%s "
+            "max_pages=%s is_model_layers_78=%s is_indexer=%s",
+            label,
+            worker_idx,
+            layer_name,
+            type(spec).__name__,
+            getattr(spec, "block_size", None),
+            getattr(spec, "page_size_bytes", None),
+            getattr(spec, "head_size", None),
+            _kz_format_dtype(getattr(spec, "dtype", None)),
+            getattr(spec, "cache_dtype_str", None),
+            getattr(spec, "dcp_replicated", False),
+            spec.max_memory_usage_bytes(vllm_config),
+            _kz_spec_max_pages(vllm_config, spec),
+            "model.layers.78" in layer_name,
+            "index" in layer_name.lower(),
+        )
+
+
+def _kz_log_kv_groups(
+    vllm_config: VllmConfig,
+    label: str,
+    worker_idx: int | str,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> None:
+    if not _kz_kv_diag_enabled():
+        return
+    logger.info(
+        "KZ_KV_DIAG_GROUPS label=%s worker=%s group_count=%d",
+        label,
+        worker_idx,
+        len(kv_cache_groups),
+    )
+    for group_idx, group in enumerate(kv_cache_groups):
+        spec = group.kv_cache_spec
+        layer78 = [name for name in group.layer_names if "model.layers.78" in name]
+        indexers = [name for name in group.layer_names if "index" in name.lower()]
+        logger.info(
+            "KZ_KV_DIAG_GROUP label=%s worker=%s group=%d layer_count=%d "
+            "spec_type=%s page_size_bytes=%s max_required_pages=%s "
+            "dcp_replicated=%s total_max_memory_bytes=%s is_eagle_group=%s "
+            "model_layers_78=%s indexer_layers=%s layers=%s",
+            label,
+            worker_idx,
+            group_idx,
+            len(group.layer_names),
+            type(spec).__name__,
+            getattr(spec, "page_size_bytes", None),
+            _kz_spec_max_pages(vllm_config, spec),
+            getattr(spec, "dcp_replicated", False),
+            spec.max_memory_usage_bytes(vllm_config),
+            getattr(group, "is_eagle_group", False),
+            layer78,
+            indexers,
+            group.layer_names,
+        )
+
+
+def _kz_log_kv_config(
+    label: str,
+    worker_idx: int,
+    kv_cache_config: KVCacheConfig,
+) -> None:
+    if not _kz_kv_diag_enabled():
+        return
+    total_bytes = sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
+    logger.info(
+        "KZ_KV_DIAG_CONFIG label=%s worker=%d num_blocks=%d "
+        "tensor_count=%d total_allocated_kv_tensor_bytes=%d",
+        label,
+        worker_idx,
+        kv_cache_config.num_blocks,
+        len(kv_cache_config.kv_cache_tensors),
+        total_bytes,
+    )
+    for tensor_idx, tensor in enumerate(kv_cache_config.kv_cache_tensors):
+        logger.info(
+            "KZ_KV_DIAG_TENSOR label=%s worker=%d tensor=%d size=%d "
+            "offset=%s block_stride=%s shared_by=%s",
+            label,
+            worker_idx,
+            tensor_idx,
+            tensor.size,
+            getattr(tensor, "offset", None),
+            getattr(tensor, "block_stride", None),
+            tensor.shared_by,
+        )
+
 # The hash seed for the first block of any prefix block sequence.
 #
 # We use a random value to avoid hash collisions or PYTHONHASHSEED environment
@@ -1491,14 +1613,12 @@ def group_and_unify_kv_cache_specs(
     has_swa = any(
         isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
     )
-    # DFlash-under-DCP draft: full-attention layers replicated on every DCP
-    # rank. They have a different page size than the MLA target and need their
-    # own group, but the DeepseekV4 multi-group allocator (with page-size
-    # padding) handles exactly that, so route them through here too.
+    # Draft layers replicated on every DCP rank need their own group so the
+    # scheduler/block-table path treats them as full-context local caches while
+    # target layers remain DCP-sharded. DFlash uses FullAttentionSpec here; GLM
+    # MTP/indexer caches use MLAAttentionSpec, so do not exclude MLA specs.
     has_repl = any(
-        getattr(spec, "dcp_replicated", False)
-        and not isinstance(spec, MLAAttentionSpec)
-        for spec in kv_cache_spec.values()
+        getattr(spec, "dcp_replicated", False) for spec in kv_cache_spec.values()
     )
     if not (has_swa or has_repl):
         return None
@@ -1507,20 +1627,24 @@ def group_and_unify_kv_cache_specs(
     grouped_swa_mla_specs: dict[
         tuple[int, int, bool], dict[str, KVCacheSpec]
     ] = defaultdict(dict)
-    # dcp_replicated non-MLA groups (e.g. the DFlash draft), keyed by block_size.
-    grouped_repl_specs: dict[tuple[int], dict[str, KVCacheSpec]] = defaultdict(dict)
+    # dcp_replicated groups (e.g. DFlash draft or GLM MLA MTP/indexer draft),
+    # keyed by block size and page size so unlike replicated cache layouts do
+    # not get merged accidentally.
+    grouped_repl_specs: dict[tuple[int, int], dict[str, KVCacheSpec]] = defaultdict(
+        dict
+    )
     # NOTE: Here we group SWA layers by (block_size, sliding_window,
     # dcp_sharded), which separates SWA layers, C4I+C4A layers, and C128A
     # layers into different groups.
     for name, spec in kv_cache_spec.items():
-        if isinstance(spec, SlidingWindowMLASpec):
+        if getattr(spec, "dcp_replicated", False):
+            grouped_repl_specs[(spec.block_size, spec.page_size_bytes)][name] = spec
+        elif isinstance(spec, SlidingWindowMLASpec):
             grouped_swa_mla_specs[
                 (spec.block_size, spec.sliding_window, spec.dcp_sharded)
             ][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
             mla_specs[name] = spec
-        elif getattr(spec, "dcp_replicated", False):
-            grouped_repl_specs[(spec.block_size,)][name] = spec
 
     if len(mla_specs) == 0:
         # No full-MLA group to anchor the DeepseekV4 layout; let the generic
@@ -1614,8 +1738,9 @@ def _get_kv_cache_groups_uniform_groups(
     ]
 
     swa_mla_specs = grouped_specs[1:]
-    # Non-first groups are SWA-MLA (DeepseekV4) or full-attention dcp_replicated
-    # drafts (DFlash under DCP). Both are padded to MLA buckets identically.
+    # Non-first groups are SWA-MLA (DeepseekV4) or dcp_replicated drafts
+    # (DFlash FullAttentionSpec, GLM MLA MTP/indexer). All are padded to MLA
+    # buckets identically.
     assert all(
         isinstance(spec, (SlidingWindowMLASpec, FullAttentionSpec))
         for group in swa_mla_specs
@@ -1831,8 +1956,29 @@ def _max_memory_usage_bytes_from_groups(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         for group in kv_cache_groups
     ):
-        # Special case (only DeepseekV4 for now): all groups are
-        # UniformTypeKVCacheSpecs.
+        flat_specs = [
+            spec
+            for group in kv_cache_groups
+            for spec in cast(
+                UniformTypeKVCacheSpecs, group.kv_cache_spec
+            ).kv_cache_specs.values()
+        ]
+        has_deepseek_v4_swa = any(
+            isinstance(spec, SlidingWindowMLASpec)
+            and getattr(spec, "model_version", None) == "deepseek_v4"
+            for spec in flat_specs
+        )
+        if not has_deepseek_v4_swa:
+            # Mixed GLM target + replicated MTP/indexer groups are also all
+            # UniformTypeKVCacheSpecs, but they do not use DeepSeekV4's padded
+            # MLA/SWA tuple layout. Sum the actual per-layer requirements so a
+            # tiny replicated draft group is not charged as if it were padded
+            # to the target layer-tuple count.
+            return sum(
+                spec.max_memory_usage_bytes(vllm_config) for spec in flat_specs
+            )
+
+        # DeepseekV4 special case: all groups are UniformTypeKVCacheSpecs.
         # They must already be page_size aligned and share a common padded
         # layer-tuple layout. Even groups with fewer actual tuples still reserve
         # the global number of tuple slots in the shared tensor layout.
@@ -2060,10 +2206,35 @@ def get_kv_cache_configs(
     # Check if the KV cache specs are registered correctly.
     # This is to prevent that some layers are initialized with unregistered specs.
     KVCacheSpecRegistry.check_kv_cache_spec_registry(merged_kv_cache_specs)
+    if _kz_kv_diag_enabled():
+        logger.info(
+            "KZ_KV_DIAG_ENV KZ_KV_DIAG=%s VLLM_DCP_GLOBAL_TOPK=%s "
+            "VLLM_DCP_SHARD_DRAFT=%s VLLM_DCP_GLOBAL_TOPK_PREFILL_ONLY=%s "
+            "VLLM_DCP_TOPK_FORCE_DEEPGEMM=%s",
+            os.getenv("KZ_KV_DIAG"),
+            os.getenv("VLLM_DCP_GLOBAL_TOPK"),
+            os.getenv("VLLM_DCP_SHARD_DRAFT"),
+            os.getenv("VLLM_DCP_GLOBAL_TOPK_PREFILL_ONLY"),
+            os.getenv("VLLM_DCP_TOPK_FORCE_DEEPGEMM"),
+        )
+        for worker_idx, kv_cache_spec_one_worker in enumerate(kv_cache_specs):
+            _kz_log_kv_specs(
+                vllm_config,
+                "worker_pre_group",
+                worker_idx,
+                kv_cache_spec_one_worker,
+            )
+        _kz_log_kv_specs(
+            vllm_config,
+            "merged_pre_group",
+            "all",
+            merged_kv_cache_specs,
+        )
     # Get global KV cache groups. This also handles spec unification for
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.
     # After this call, merged_kv_cache_specs may be modified in-place.
     global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
+    _kz_log_kv_groups(vllm_config, "global_post_group", "all", global_kv_cache_groups)
 
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.
@@ -2072,6 +2243,21 @@ def get_kv_cache_configs(
         _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
         for worker_spec in kv_cache_specs
     ]
+    if _kz_kv_diag_enabled():
+        for worker_idx, (groups, avail_mem) in enumerate(
+            zip(projected_groups_per_worker, available_memory)
+        ):
+            logger.info(
+                "KZ_KV_DIAG_AVAILABLE worker=%d available_kv_cache_memory_bytes=%d",
+                worker_idx,
+                avail_mem,
+            )
+            _kz_log_kv_groups(
+                vllm_config,
+                "worker_projected_post_group",
+                worker_idx,
+                groups,
+            )
 
     # If `num_gpu_blocks_override` is set, the cache size that will actually
     # be allocated is decoupled from the profiled `available_memory`:
@@ -2123,6 +2309,9 @@ def get_kv_cache_configs(
                 vllm_config, projected_groups, available_memory_one_worker
             )
         )
+    if _kz_kv_diag_enabled():
+        for worker_idx, kv_cache_config in enumerate(kv_cache_configs):
+            _kz_log_kv_config("pre_min_blocks", worker_idx, kv_cache_config)
 
     # Change the num_blocks of each rank to the smallest among all ranks.
     # We also need to shrink the tensor size proportionally to avoid
@@ -2130,7 +2319,7 @@ def get_kv_cache_configs(
     min_num_blocks = min(
         kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
     )
-    for kv_cache_config in kv_cache_configs:
+    for worker_idx, kv_cache_config in enumerate(kv_cache_configs):
         num_blocks_old = kv_cache_config.num_blocks
         kv_cache_config.num_blocks = min_num_blocks
 
@@ -2138,6 +2327,7 @@ def get_kv_cache_configs(
         for tensor in kv_cache_config.kv_cache_tensors:
             assert tensor.size % num_blocks_old == 0
             tensor.size = tensor.size // num_blocks_old * min_num_blocks
+        _kz_log_kv_config("post_min_blocks", worker_idx, kv_cache_config)
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             max_model_len = vllm_config.model_config.max_model_len

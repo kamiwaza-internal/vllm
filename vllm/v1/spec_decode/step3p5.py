@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from copy import copy
 
 import torch
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config, replace
+from vllm.distributed.parallel_state import get_dcp_group
 from vllm.forward_context import set_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models.utils import get_draft_quant_config
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
@@ -19,6 +23,8 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 from vllm.v1.worker.utils import AttentionGroup
+
+logger = init_logger(__name__)
 
 
 class Step3p5MTPProposer(EagleProposer):
@@ -36,6 +42,105 @@ class Step3p5MTPProposer(EagleProposer):
         # Slot-mapping buffers for non-primary KV cache groups (the primary
         # group reuses self._slot_mapping_buffer from the base class).
         self._per_group_slot_mapping_buffers: dict[int, torch.Tensor] = {}
+        self._mtp_dcp_diag_enabled = os.environ.get("VLLM_MTP_DCP_DIAG", "0") == "1"
+        self._mtp_dcp_diag_limit = int(os.environ.get("VLLM_MTP_DCP_DIAG_LIMIT", "8"))
+        self._mtp_dcp_diag_tokens = int(os.environ.get("VLLM_MTP_DCP_DIAG_TOKENS", "8"))
+        self._mtp_dcp_diag_cycle = 0
+        self._mtp_broadcast_draft_tokens = (
+            os.environ.get("VLLM_MTP_BROADCAST_DRAFT_TOKENS", "0") == "1"
+        )
+        raw_recompute_until = os.environ.get(
+            "VLLM_MTP_RECOMPUTE_TOPK_UNTIL_STEP",
+            "",
+        )
+        try:
+            self._mtp_recompute_topk_until_step = (
+                int(raw_recompute_until) if raw_recompute_until else 10**9
+            )
+        except ValueError:
+            self._mtp_recompute_topk_until_step = 10**9
+
+    def _diag_rank_info(self) -> tuple[int, int, int]:
+        rank = -1
+        dcp_rank = -1
+        dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+        try:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+        except Exception:
+            rank = -1
+        if dcp_size > 1:
+            try:
+                dcp_rank = get_dcp_group().rank_in_group
+            except Exception:
+                dcp_rank = -1
+        else:
+            dcp_rank = 0
+        return rank, dcp_rank, dcp_size
+
+    @staticmethod
+    def _diag_tensor_head(
+        tensor: torch.Tensor | None,
+        limit: int,
+    ) -> list[int] | None:
+        if tensor is None:
+            return None
+        try:
+            view = tensor.detach().reshape(-1)[:limit]
+            return [int(x) for x in view.cpu().tolist()]
+        except Exception:
+            return None
+
+    def _log_mtp_dcp_diag(
+        self,
+        label: str,
+        spec_step_idx: int,
+        draft_token_ids: torch.Tensor | None,
+        common_attn_metadata: CommonAttentionMetadata,
+        positions: torch.Tensor | None = None,
+    ) -> None:
+        if not self._mtp_dcp_diag_enabled:
+            return
+        if self._mtp_dcp_diag_cycle >= self._mtp_dcp_diag_limit:
+            return
+
+        limit = self._mtp_dcp_diag_tokens
+        rank, dcp_rank, dcp_size = self._diag_rank_info()
+        num_reqs = common_attn_metadata.num_reqs
+        seq_lens = self._diag_tensor_head(
+            common_attn_metadata.seq_lens[:num_reqs],
+            limit,
+        )
+        dcp_local_seq_lens = self._diag_tensor_head(
+            None
+            if common_attn_metadata.dcp_local_seq_lens is None
+            else common_attn_metadata.dcp_local_seq_lens[:num_reqs],
+            limit,
+        )
+        slot_mapping = self._diag_tensor_head(
+            common_attn_metadata.slot_mapping,
+            limit,
+        )
+        positions_head = self._diag_tensor_head(positions, limit)
+        draft_head = self._diag_tensor_head(draft_token_ids, limit)
+
+        logger.warning(
+            "KZ_MTP_DCP_DIAG cycle=%s label=%s rank=%s dcp_rank=%s "
+            "dcp_size=%s spec_step=%s num_reqs=%s draft_head=%s "
+            "seq_lens=%s dcp_local_seq_lens=%s positions=%s slot_mapping=%s",
+            self._mtp_dcp_diag_cycle,
+            label,
+            rank,
+            dcp_rank,
+            dcp_size,
+            spec_step_idx,
+            num_reqs,
+            draft_head,
+            seq_lens,
+            dcp_local_seq_lens,
+            positions_head,
+            slot_mapping,
+        )
 
     def set_per_group_attn_metadata(
         self,
@@ -54,6 +159,67 @@ class Step3p5MTPProposer(EagleProposer):
             buf = torch.zeros(self.max_positions, dtype=torch.int64, device=self.device)
             self._per_group_slot_mapping_buffers[gid] = buf
         return buf
+
+    def _set_mtp_skip_topk(self, skip: bool) -> None:
+        if not getattr(self, "_share_mtp_indices", False):
+            return
+        model = getattr(self.model, "model", None)
+        if model is not None and hasattr(model, "set_skip_topk"):
+            model.set_skip_topk(skip)
+
+    def _sync_dcp_draft_token_ids(
+        self,
+        draft_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self._mtp_broadcast_draft_tokens:
+            return draft_token_ids
+        dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+        if dcp_size <= 1:
+            return draft_token_ids
+        try:
+            return get_dcp_group().broadcast(draft_token_ids.contiguous(), src=0)
+        except Exception:
+            logger.exception(
+                "Failed to broadcast Step3.5 MTP draft token ids across DCP ranks"
+            )
+            raise
+
+    def _refresh_dcp_local_seq_lens(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> None:
+        dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+        if dcp_size <= 1 or common_attn_metadata.dcp_local_seq_lens is None:
+            return
+
+        num_reqs = common_attn_metadata.num_reqs
+        dcp_rank = get_dcp_group().rank_in_group
+        interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+        updated = get_dcp_local_seq_lens(
+            common_attn_metadata.seq_lens[:num_reqs],
+            dcp_size,
+            dcp_rank,
+            interleave,
+        )
+        common_attn_metadata.dcp_local_seq_lens[:num_reqs].copy_(updated)
+
+        if common_attn_metadata.dcp_local_seq_lens_cpu is None:
+            return
+
+        if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
+            cpu_source = common_attn_metadata.seq_lens_cpu_upper_bound[:num_reqs]
+            cpu_updated = get_dcp_local_seq_lens(
+                cpu_source,
+                dcp_size,
+                dcp_rank,
+                interleave,
+            )
+        else:
+            cpu_updated = updated.detach().to(
+                device=common_attn_metadata.dcp_local_seq_lens_cpu.device,
+                non_blocking=True,
+            )
+        common_attn_metadata.dcp_local_seq_lens_cpu[:num_reqs].copy_(cpu_updated)
 
     def _get_slot_mapping(
         self,
@@ -115,6 +281,14 @@ class Step3p5MTPProposer(EagleProposer):
             buf[:batch_size].copy_(sm)
             if input_batch_size > batch_size:
                 buf[batch_size:input_batch_size].fill_(PADDING_SLOT_ID)
+            self._write_dcp_sharded_slot_mapping(
+                gid,
+                block_table,
+                new_positions_1d,
+                exceeds,
+                buf[:input_batch_size],
+                input_batch_size,
+            )
             self._per_group_slot_mappings[gid] = buf[:batch_size]
         return positions
 
@@ -262,14 +436,17 @@ class Step3p5MTPProposer(EagleProposer):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not self._enable_probabilistic_draft_probs or sampling_metadata.all_greedy:
             if self.use_local_argmax_reduction:
-                return self.model.get_top_tokens(hidden_states), None
-            logits = self.model.compute_logits(
-                hidden_states, spec_step_idx=spec_step_idx
-            )
-            return logits.argmax(dim=-1), None
+                draft_token_ids = self._model_get_top_tokens(
+                    hidden_states, spec_step_idx
+                )
+                return self._sync_dcp_draft_token_ids(draft_token_ids), None
+            logits = self._model_compute_logits(hidden_states, spec_step_idx)
+            draft_token_ids = logits.argmax(dim=-1)
+            return self._sync_dcp_draft_token_ids(draft_token_ids), None
 
-        logits = self.model.compute_logits(hidden_states, spec_step_idx=spec_step_idx)
-        return self._sample_from_logits(logits, sampling_metadata)
+        logits = self._model_compute_logits(hidden_states, spec_step_idx)
+        draft_token_ids, draft_probs = self._sample_from_logits(logits, sampling_metadata)
+        return self._sync_dcp_draft_token_ids(draft_token_ids), draft_probs
 
     def propose(
         self,
@@ -309,13 +486,14 @@ class Step3p5MTPProposer(EagleProposer):
 
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
             self._determine_batch_execution_and_padding(num_tokens)
-        )
+                )
 
         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
             num_tokens, num_input_tokens, mm_embed_inputs
         )
         model_kwargs["spec_step_idx"] = 0
 
+        self._set_mtp_skip_topk(False)
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -343,6 +521,7 @@ class Step3p5MTPProposer(EagleProposer):
                 self._last_draft_probs = draft_probs.view(
                     -1, self.num_speculative_tokens, draft_probs.shape[-1]
                 ).contiguous()
+            self._set_mtp_skip_topk(False)
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:
@@ -356,6 +535,13 @@ class Step3p5MTPProposer(EagleProposer):
 
         draft_token_ids, draft_probs = self._sample_draft_tokens_for_step(
             sample_hidden_states, sampling_metadata, spec_step_idx=0
+        )
+        self._log_mtp_dcp_diag(
+            "draft_step",
+            0,
+            draft_token_ids,
+            common_attn_metadata,
+            positions,
         )
         draft_probs_list = None if draft_probs is None else [draft_probs]
 
@@ -386,11 +572,22 @@ class Step3p5MTPProposer(EagleProposer):
             common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
             common_attn_metadata._seq_lens_cpu = None
             common_attn_metadata._num_computed_tokens_cpu = None
+            self._refresh_dcp_local_seq_lens(common_attn_metadata)
 
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
+        recompute_topk_from_step = getattr(
+            self, "_mtp_recompute_topk_from_step", 10**9
+        )
+        recompute_topk_until_step = getattr(
+            self, "_mtp_recompute_topk_until_step", 10**9
+        )
         for token_index in range(self.num_speculative_tokens - 1):
             spec_step_idx = token_index + 1
+            self._set_mtp_skip_topk(
+                spec_step_idx < recompute_topk_from_step
+                or spec_step_idx > recompute_topk_until_step
+            )
             input_ids = draft_token_ids_list[-1].int()
 
             if not self.constant_draft_positions:
@@ -401,6 +598,7 @@ class Step3p5MTPProposer(EagleProposer):
                     input_batch_size,
                     block_size,
                 )
+                self._refresh_dcp_local_seq_lens(common_attn_metadata)
 
             if not self.constant_draft_positions or token_index == 0:
                 _, per_layer_attn_metadata = (
@@ -450,12 +648,28 @@ class Step3p5MTPProposer(EagleProposer):
                 sampling_metadata,
                 spec_step_idx=spec_step_idx,
             )
+            self._log_mtp_dcp_diag(
+                "draft_step",
+                spec_step_idx,
+                draft_token_ids,
+                common_attn_metadata,
+                positions,
+            )
             if draft_probs is not None:
                 assert draft_probs_list is not None
                 draft_probs_list.append(draft_probs)
             draft_token_ids_list.append(draft_token_ids)
 
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        self._log_mtp_dcp_diag(
+            "draft_stack",
+            self.num_speculative_tokens - 1,
+            draft_token_ids,
+            common_attn_metadata,
+            positions,
+        )
+        self._mtp_dcp_diag_cycle += 1
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
+        self._set_mtp_skip_topk(False)
         return draft_token_ids

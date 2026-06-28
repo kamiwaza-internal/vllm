@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+from copy import copy
 from importlib.util import find_spec
 from inspect import signature
 from typing import Any, cast
@@ -16,7 +17,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     replace,
 )
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -30,6 +31,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
@@ -158,6 +160,20 @@ class SpecDecodeBaseProposer:
         self.kv_cache_gid: int = -1
         self._draft_layer_to_kv_cache_gid: dict[str, int] = {}
         self._draft_kv_cache_group_ids: list[int] = []
+        self._draft_kv_cache_group_dcp_replicated: dict[int, bool] = {}
+        self._per_group_block_tables: dict[int, torch.Tensor] = {}
+        self._per_group_slot_mappings: dict[int, torch.Tensor] = {}
+        self._per_group_slot_mapping_buffers: dict[int, torch.Tensor] = {}
+        self._mtp_dcp_diag_enabled = os.environ.get("VLLM_MTP_DCP_DIAG", "0") == "1"
+        self._mtp_dcp_diag_limit = int(os.environ.get("VLLM_MTP_DCP_DIAG_LIMIT", "8"))
+        self._mtp_dcp_diag_tokens = int(os.environ.get("VLLM_MTP_DCP_DIAG_TOKENS", "8"))
+        self._mtp_draft_prob_diag_enabled = (
+            os.environ.get("VLLM_MTP_DRAFT_PROB_DIAG", "0") == "1"
+        )
+        self._mtp_draft_prob_diag_topk = int(
+            os.environ.get("VLLM_MTP_DRAFT_PROB_DIAG_TOPK", "3")
+        )
+        self._mtp_dcp_diag_cycle = 0
         self.eagle3_use_aux_hidden_state: bool = (
             self._get_eagle3_use_aux_hidden_state_from_config()
         )
@@ -258,6 +274,13 @@ class SpecDecodeBaseProposer:
             and self.speculative_config.draft_sample_method == "probabilistic"
         )
         self._last_draft_probs: torch.Tensor | None = None
+        raw_recompute_from = os.environ.get("VLLM_MTP_RECOMPUTE_TOPK_FROM_STEP", "")
+        try:
+            self._mtp_recompute_topk_from_step = (
+                int(raw_recompute_from) if raw_recompute_from else 10**9
+            )
+        except ValueError:
+            self._mtp_recompute_topk_from_step = 10**9
 
         self._slot_mapping_buffer = torch.zeros(
             self.max_positions,
@@ -395,15 +418,57 @@ class SpecDecodeBaseProposer:
                 positions = positions[0]
             self.positions[:num_tokens] = positions
 
+    def _slot_mapping_buffer_for(self, gid: int) -> torch.Tensor:
+        if gid == self.kv_cache_gid:
+            return self._slot_mapping_buffer
+        buf = self._per_group_slot_mapping_buffers.get(gid)
+        if buf is None:
+            buf = torch.zeros(self.max_positions, dtype=torch.int64, device=self.device)
+            self._per_group_slot_mapping_buffers[gid] = buf
+        return buf
+
+    def set_per_group_attn_metadata(
+        self,
+        gid: int,
+        block_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        self._per_group_block_tables[gid] = block_table
+        self._per_group_slot_mappings[gid] = slot_mapping
+
     def _get_slot_mapping(
         self,
         num_tokens: int,
         slot_mapping: torch.Tensor | None = None,
+        slot_mappings_by_layer: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Return slot_mapping dict for EAGLE layers.
 
         If slot_mapping is provided, copies it into the buffer first.
         """
+        if len(self._draft_kv_cache_group_ids) > 1:
+            per_layer: dict[str, torch.Tensor] = {}
+            for attn_group in self.draft_attn_groups:
+                gid = attn_group.kv_cache_group_id
+                buf = self._slot_mapping_buffer_for(gid)
+                source = self._per_group_slot_mappings.get(gid)
+                if source is None and slot_mappings_by_layer is not None:
+                    for layer_name in attn_group.layer_names:
+                        source = slot_mappings_by_layer.get(layer_name)
+                        if source is not None:
+                            break
+                if source is None and gid == self.kv_cache_gid:
+                    source = slot_mapping
+                if source is not None and buf.data_ptr() != source.data_ptr():
+                    num_actual = min(source.shape[0], num_tokens)
+                    buf[:num_actual].copy_(source[:num_actual])
+                    if num_tokens > num_actual:
+                        buf[num_actual:num_tokens].fill_(PADDING_SLOT_ID)
+                view = buf[:num_tokens]
+                for layer_name in attn_group.layer_names:
+                    per_layer[layer_name] = view
+            return per_layer
+
         if slot_mapping is not None:
             num_actual = slot_mapping.shape[0]
             self._slot_mapping_buffer[:num_actual].copy_(slot_mapping)
@@ -498,6 +563,193 @@ class SpecDecodeBaseProposer:
     def take_last_draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs
 
+    def _diag_rank_info(self) -> tuple[int, int, int]:
+        rank = -1
+        dcp_rank = -1
+        dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+        try:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+        except Exception:
+            rank = -1
+        if dcp_size > 1:
+            try:
+                dcp_rank = get_dcp_group().rank_in_group
+            except Exception:
+                dcp_rank = -1
+        else:
+            dcp_rank = 0
+        return rank, dcp_rank, dcp_size
+
+    @staticmethod
+    def _diag_tensor_head(
+        tensor: torch.Tensor | None,
+        limit: int,
+    ) -> list[int] | None:
+        if tensor is None:
+            return None
+        try:
+            view = tensor.detach().reshape(-1)[:limit]
+            return [int(x) for x in view.cpu().tolist()]
+        except Exception:
+            return None
+
+    @staticmethod
+    def _diag_float_tensor_head(
+        tensor: torch.Tensor | None,
+        limit: int,
+    ) -> list[float] | None:
+        if tensor is None:
+            return None
+        try:
+            view = tensor.detach().reshape(-1)[:limit]
+            return [round(float(x), 6) for x in view.cpu().tolist()]
+        except Exception:
+            return None
+
+    def _diag_slot_owner_head(
+        self,
+        positions: torch.Tensor | None,
+        limit: int,
+    ) -> tuple[list[int] | None, list[int] | None]:
+        if positions is None:
+            return None, None
+        try:
+            dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+            if dcp_size <= 1 or self.block_size <= 0:
+                return None, None
+            dcp_rank = get_dcp_group().rank_in_group
+            interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+            positions_1d = positions[0] if positions.ndim > 1 else positions
+            positions_i64 = (
+                positions_1d.detach().reshape(-1)[:limit].to(torch.int64)
+            )
+            virtual_block_size = self.block_size * dcp_size
+            virtual_offsets = positions_i64 % virtual_block_size
+            owners = ((virtual_offsets // interleave) % dcp_size).to(torch.int64)
+            is_local = owners == dcp_rank
+            return (
+                [int(x) for x in owners.cpu().tolist()],
+                [int(x) for x in is_local.cpu().tolist()],
+            )
+        except Exception:
+            return None, None
+
+    def _diag_skip_topk_state(self) -> bool | None:
+        try:
+            model = getattr(self.model, "model", None)
+            if model is None:
+                return None
+            for _, module in model.named_modules():
+                if hasattr(module, "skip_topk"):
+                    return bool(module.skip_topk)
+        except Exception:
+            return None
+        return None
+
+    def _log_mtp_dcp_diag(
+        self,
+        label: str,
+        spec_step_idx: int,
+        draft_token_ids: torch.Tensor | None,
+        common_attn_metadata: CommonAttentionMetadata,
+        positions: torch.Tensor | None = None,
+    ) -> None:
+        if not self._mtp_dcp_diag_enabled:
+            return
+        if self._mtp_dcp_diag_cycle >= self._mtp_dcp_diag_limit:
+            return
+
+        limit = self._mtp_dcp_diag_tokens
+        rank, dcp_rank, dcp_size = self._diag_rank_info()
+        num_reqs = common_attn_metadata.num_reqs
+        seq_lens = self._diag_tensor_head(
+            common_attn_metadata.seq_lens[:num_reqs],
+            limit,
+        )
+        dcp_local_seq_lens = self._diag_tensor_head(
+            None
+            if common_attn_metadata.dcp_local_seq_lens is None
+            else common_attn_metadata.dcp_local_seq_lens[:num_reqs],
+            limit,
+        )
+        slot_mapping = self._diag_tensor_head(
+            common_attn_metadata.slot_mapping,
+            limit,
+        )
+        positions_head = self._diag_tensor_head(positions, limit)
+        draft_head = self._diag_tensor_head(draft_token_ids, limit)
+        slot_owner, slot_is_local = self._diag_slot_owner_head(positions, limit)
+        skip_topk = self._diag_skip_topk_state()
+
+        logger.warning(
+            "KZ_MTP_DCP_DIAG cycle=%s label=%s rank=%s dcp_rank=%s "
+            "dcp_size=%s spec_step=%s num_reqs=%s draft_head=%s "
+            "seq_lens=%s dcp_local_seq_lens=%s positions=%s "
+            "slot_owner=%s slot_is_local=%s slot_mapping=%s skip_topk=%s",
+            self._mtp_dcp_diag_cycle,
+            label,
+            rank,
+            dcp_rank,
+            dcp_size,
+            spec_step_idx,
+            num_reqs,
+            draft_head,
+            seq_lens,
+            dcp_local_seq_lens,
+            positions_head,
+            slot_owner,
+            slot_is_local,
+            slot_mapping,
+            skip_topk,
+        )
+
+    def _log_mtp_draft_probability_diag(
+        self,
+        spec_step_idx: int,
+        hidden_states: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+    ) -> None:
+        if not self._mtp_draft_prob_diag_enabled:
+            return
+        if self._mtp_dcp_diag_cycle >= self._mtp_dcp_diag_limit:
+            return
+        try:
+            limit = self._mtp_dcp_diag_tokens
+            rank, dcp_rank, dcp_size = self._diag_rank_info()
+            logits = self._model_compute_logits(hidden_states, spec_step_idx)
+            log_probs = logits.log_softmax(dim=-1)
+            draft_token_ids_i64 = draft_token_ids.to(torch.long).reshape(-1)
+            rows = torch.arange(
+                draft_token_ids_i64.shape[0],
+                device=log_probs.device,
+                dtype=torch.long,
+            )
+            draft_probs = log_probs[rows, draft_token_ids_i64].exp()
+            topk = min(self._mtp_draft_prob_diag_topk, log_probs.shape[-1])
+            top_log_probs, top_ids = torch.topk(log_probs, k=topk, dim=-1)
+            draft_argmax = top_ids[:, 0]
+            draft_argmax_match = draft_argmax == draft_token_ids_i64
+            logger.warning(
+                "KZ_MTP_DRAFT_PROB_DIAG cycle=%s rank=%s dcp_rank=%s "
+                "dcp_size=%s spec_step=%s draft_head=%s draft_p=%s "
+                "draft_argmax=%s draft_argmax_match=%s draft_top_ids=%s "
+                "draft_top_p=%s",
+                self._mtp_dcp_diag_cycle,
+                rank,
+                dcp_rank,
+                dcp_size,
+                spec_step_idx,
+                self._diag_tensor_head(draft_token_ids_i64, limit),
+                self._diag_float_tensor_head(draft_probs, limit),
+                self._diag_tensor_head(draft_argmax, limit),
+                self._diag_tensor_head(draft_argmax_match.to(torch.int32), limit),
+                self._diag_tensor_head(top_ids, limit * topk),
+                self._diag_float_tensor_head(top_log_probs.exp(), limit * topk),
+            )
+        except Exception:
+            logger.exception("Failed to log KZ_MTP_DRAFT_PROB_DIAG")
+
     def propose(
         self,
         num_speculative_tokens,
@@ -576,7 +828,9 @@ class SpecDecodeBaseProposer:
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             slot_mapping=self._get_slot_mapping(
-                slot_mapping_size, common_attn_metadata.slot_mapping
+                slot_mapping_size,
+                common_attn_metadata.slot_mapping,
+                slot_mappings if isinstance(slot_mappings, dict) else None,
             ),
         ):
             ret_hidden_states = self._model_forward(model_kwargs, spec_step_idx=0)
@@ -589,7 +843,9 @@ class SpecDecodeBaseProposer:
         # After step 0: switch to reuse mode so steps 1+ skip the indexer
         # and read the indices that step 0 just wrote into the shared buffer.
         if self._share_mtp_indices and hasattr(self.model.model, "set_skip_topk"):
-            self.model.model.set_skip_topk(True)
+            self.model.model.set_skip_topk(
+                self._mtp_recompute_topk_from_step > 1
+            )
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
 
@@ -671,6 +927,18 @@ class SpecDecodeBaseProposer:
             draft_token_ids, draft_probs = self._sample_draft_tokens(
                 sample_hidden_states, sampling_metadata, spec_step_idx=0
             )
+            self._log_mtp_draft_probability_diag(
+                0,
+                sample_hidden_states,
+                draft_token_ids,
+            )
+            self._log_mtp_dcp_diag(
+                "draft_step",
+                0,
+                draft_token_ids,
+                common_attn_metadata,
+            )
+            self._mtp_dcp_diag_cycle += 1
             if draft_probs is not None:
                 self._last_draft_probs = draft_probs.view(
                     -1, self.num_speculative_tokens, draft_probs.shape[-1]
@@ -691,6 +959,18 @@ class SpecDecodeBaseProposer:
 
         draft_token_ids, draft_probs = self._sample_draft_tokens(
             sample_hidden_states, sampling_metadata, spec_step_idx=0
+        )
+        self._log_mtp_draft_probability_diag(
+            0,
+            sample_hidden_states,
+            draft_token_ids,
+        )
+        self._log_mtp_dcp_diag(
+            "draft_step",
+            0,
+            draft_token_ids,
+            common_attn_metadata,
+            positions,
         )
         draft_probs_list = None if draft_probs is None else [draft_probs]
 
@@ -727,6 +1007,7 @@ class SpecDecodeBaseProposer:
             # Invalidate the CPU-side shadows to avoid H<>D sync.
             common_attn_metadata._seq_lens_cpu = None
             common_attn_metadata._num_computed_tokens_cpu = None
+            self._refresh_dcp_local_seq_lens(common_attn_metadata)
 
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
@@ -744,6 +1025,7 @@ class SpecDecodeBaseProposer:
                     input_batch_size,
                     block_size,
                 )
+                self._refresh_dcp_local_seq_lens(common_attn_metadata)
 
             # Rebuild attention metadata. When draft positions are constant
             # (e.g. Gemma4 MTP), common_attn_metadata is invariant across
@@ -769,6 +1051,10 @@ class SpecDecodeBaseProposer:
 
             # Run the model.
             spec_step_idx = token_index + 1
+            if self._share_mtp_indices and hasattr(self.model.model, "set_skip_topk"):
+                self.model.model.set_skip_topk(
+                    spec_step_idx < self._mtp_recompute_topk_from_step
+                )
             model_kwargs = {
                 "input_ids": input_ids,
                 "positions": self._get_positions(input_batch_size),
@@ -800,6 +1086,18 @@ class SpecDecodeBaseProposer:
                 sampling_metadata,
                 spec_step_idx=spec_step_idx,
             )
+            self._log_mtp_draft_probability_diag(
+                spec_step_idx,
+                last_hidden_states[:batch_size],
+                draft_token_ids,
+            )
+            self._log_mtp_dcp_diag(
+                "draft_step",
+                spec_step_idx,
+                draft_token_ids,
+                common_attn_metadata,
+                positions,
+            )
             if draft_probs is not None:
                 assert draft_probs_list is not None
                 draft_probs_list.append(draft_probs)
@@ -807,9 +1105,115 @@ class SpecDecodeBaseProposer:
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        self._log_mtp_dcp_diag(
+            "draft_stack",
+            self.num_speculative_tokens - 1,
+            draft_token_ids,
+            common_attn_metadata,
+            positions,
+        )
+        self._mtp_dcp_diag_cycle += 1
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         return draft_token_ids
+
+    def _refresh_dcp_local_seq_lens(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> None:
+        dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+        if dcp_size <= 1 or common_attn_metadata.dcp_local_seq_lens is None:
+            return
+
+        num_reqs = common_attn_metadata.num_reqs
+        dcp_rank = get_dcp_group().rank_in_group
+        interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+        updated = get_dcp_local_seq_lens(
+            common_attn_metadata.seq_lens[:num_reqs],
+            dcp_size,
+            dcp_rank,
+            interleave,
+        )
+        common_attn_metadata.dcp_local_seq_lens[:num_reqs].copy_(updated)
+
+        if common_attn_metadata.dcp_local_seq_lens_cpu is None:
+            return
+
+        if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
+            cpu_source = common_attn_metadata.seq_lens_cpu_upper_bound[:num_reqs]
+            cpu_updated = get_dcp_local_seq_lens(
+                cpu_source,
+                dcp_size,
+                dcp_rank,
+                interleave,
+            )
+        else:
+            cpu_updated = updated.detach().to(
+                device=common_attn_metadata.dcp_local_seq_lens_cpu.device,
+                non_blocking=True,
+            )
+        common_attn_metadata.dcp_local_seq_lens_cpu[:num_reqs].copy_(cpu_updated)
+
+    def _needs_dcp_sharded_slot_mapping(self, gid: int) -> bool:
+        dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+        if dcp_size <= 1:
+            return False
+        return not self._draft_kv_cache_group_dcp_replicated.get(gid, False)
+
+    def _write_dcp_sharded_slot_mapping(
+        self,
+        gid: int,
+        block_table_tensor: torch.Tensor,
+        positions_1d: torch.Tensor,
+        exceeds: torch.Tensor,
+        out_slot_mapping: torch.Tensor,
+        input_batch_size: int,
+    ) -> bool:
+        """Overwrite an iterative draft slot mapping with DCP-sharded layout.
+
+        The normal EAGLE iterative helper computes dense, non-DCP slots. For
+        DCP-sharded draft KV, only the owning DCP rank should write a given
+        global position; non-owning ranks must use PAD. This mirrors
+        BlockTable.compute_slot_mapping().
+        """
+        if not self._needs_dcp_sharded_slot_mapping(gid):
+            return False
+
+        batch_size = positions_1d.shape[0]
+        if batch_size == 0:
+            if input_batch_size > 0:
+                out_slot_mapping[:input_batch_size].fill_(PADDING_SLOT_ID)
+            return True
+
+        dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+        dcp_rank = get_dcp_group().rank_in_group
+        interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+        virtual_block_size = self.block_size * dcp_size
+
+        positions_i64 = positions_1d.to(torch.int64)
+        block_indices = torch.div(
+            positions_i64,
+            virtual_block_size,
+            rounding_mode="floor",
+        ).clamp(max=block_table_tensor.shape[1] - 1)
+        block_ids = block_table_tensor[:batch_size].gather(
+            1, block_indices.unsqueeze(1)
+        ).squeeze(1).to(torch.int64)
+
+        virtual_block_offsets = positions_i64 - block_indices * virtual_block_size
+        is_local = (
+            (virtual_block_offsets // interleave) % dcp_size
+        ) == dcp_rank
+        local_block_offsets = (
+            virtual_block_offsets // (dcp_size * interleave)
+        ) * interleave + (virtual_block_offsets % interleave)
+
+        slot_mapping = block_ids * self.block_size + local_block_offsets
+        slot_mapping.masked_fill_(exceeds | ~is_local, PADDING_SLOT_ID)
+        out_slot_mapping[:batch_size].copy_(slot_mapping)
+        if input_batch_size > batch_size:
+            out_slot_mapping[batch_size:input_batch_size].fill_(PADDING_SLOT_ID)
+        return True
 
     def _update_positions_dependent_metadata(
         self,
@@ -838,7 +1242,6 @@ class SpecDecodeBaseProposer:
             out_slot_mapping=self._slot_mapping_buffer[:input_batch_size],
             input_batch_size=input_batch_size,
         )
-        common_attn_metadata.slot_mapping = self._slot_mapping_buffer[:batch_size]
         if self.uses_mrope:
             self.mrope_positions[1:, :batch_size] = self.mrope_positions[0, :batch_size]
             positions = self.mrope_positions[:, :batch_size]
@@ -853,6 +1256,49 @@ class SpecDecodeBaseProposer:
             common_attn_metadata.max_seq_len + 1,
             self.max_model_len,
         )
+
+        new_positions_1d = positions[0] if self.uses_mrope else positions
+        exceeds = positions_1d + 1 >= self.max_model_len
+        self._write_dcp_sharded_slot_mapping(
+            self.kv_cache_gid,
+            common_attn_metadata.block_table_tensor,
+            new_positions_1d,
+            exceeds,
+            self._slot_mapping_buffer[:input_batch_size],
+            input_batch_size,
+        )
+        common_attn_metadata.slot_mapping = self._slot_mapping_buffer[:batch_size]
+        self._per_group_slot_mappings[self.kv_cache_gid] = (
+            common_attn_metadata.slot_mapping
+        )
+        for gid in self._draft_kv_cache_group_ids:
+            if gid == self.kv_cache_gid:
+                continue
+            block_table = self._per_group_block_tables.get(gid)
+            if block_table is None:
+                continue
+            n_blocks = block_table.shape[1]
+            block_numbers = (new_positions_1d // block_size).clamp(
+                max=n_blocks - 1
+            ).to(torch.long)
+            block_ids = block_table[:batch_size].gather(
+                1, block_numbers.unsqueeze(1)
+            ).squeeze(1)
+            slot_mapping = block_ids * block_size + (new_positions_1d % block_size)
+            slot_mapping.masked_fill_(exceeds, PADDING_SLOT_ID)
+            buf = self._slot_mapping_buffer_for(gid)
+            buf[:batch_size].copy_(slot_mapping)
+            if input_batch_size > batch_size:
+                buf[batch_size:input_batch_size].fill_(PADDING_SLOT_ID)
+            self._write_dcp_sharded_slot_mapping(
+                gid,
+                block_table,
+                new_positions_1d,
+                exceeds,
+                buf[:input_batch_size],
+                input_batch_size,
+            )
+            self._per_group_slot_mappings[gid] = buf[:batch_size]
 
         if common_attn_metadata._seq_lens_cpu is not None:
             common_attn_metadata._seq_lens_cpu += 1
@@ -1033,9 +1479,22 @@ class SpecDecodeBaseProposer:
     ) -> tuple[list[object], dict[str, object]]:
         per_group_attn_metadata: list[object] = []
         per_layer_attn_metadata: dict[str, object] = {}
+        num_reqs = common_attn_metadata.num_reqs
+        num_actual_tokens = common_attn_metadata.num_actual_tokens
         for attn_group in self.draft_attn_groups:
+            gid = attn_group.kv_cache_group_id
+            if gid in self._per_group_block_tables:
+                cm = copy(common_attn_metadata)
+                cm.block_table_tensor = self._per_group_block_tables[gid][:num_reqs]
+                if gid in self._per_group_slot_mappings:
+                    group_slot_mapping = self._per_group_slot_mappings[gid]
+                    if group_slot_mapping.shape[0] >= num_actual_tokens:
+                        group_slot_mapping = group_slot_mapping[:num_actual_tokens]
+                    cm.slot_mapping = group_slot_mapping
+            else:
+                cm = common_attn_metadata
             attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
-                common_attn_metadata=common_attn_metadata, draft_index=draft_index
+                common_attn_metadata=cm, draft_index=draft_index
             )
             per_group_attn_metadata.append(attn_metadata)
             for layer_name in attn_group.layer_names:
@@ -1378,6 +1837,11 @@ class SpecDecodeBaseProposer:
         return model
 
     def load_model(self, target_model: nn.Module) -> None:
+        print(
+            "KZ_LOAD_DIAG drafter_load_model_enter "
+            f"class={type(self).__name__} method={self.method}",
+            flush=True,
+        )
         target_attn_layer_names = set(
             get_layers_from_vllm_config(
                 self.vllm_config,
@@ -1385,7 +1849,17 @@ class SpecDecodeBaseProposer:
             ).keys()
         )
 
+        print(
+            "KZ_LOAD_DIAG drafter_get_model_start "
+            f"class={type(self).__name__} method={self.method}",
+            flush=True,
+        )
         self.model = self._get_model()
+        print(
+            "KZ_LOAD_DIAG drafter_get_model_done "
+            f"class={type(self).__name__} method={self.method}",
+            flush=True,
+        )
         self._model_forward_accepts_spec_step_idx = _call_accepts_kwarg(
             self.model.forward, "spec_step_idx"
         )
@@ -1460,9 +1934,19 @@ class SpecDecodeBaseProposer:
         else:
             target_language_model = target_model
 
+        print(
+            "KZ_LOAD_DIAG drafter_share_start "
+            f"class={type(self).__name__} method={self.method}",
+            flush=True,
+        )
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_lm_head(target_language_model)
         self._maybe_load_parallel_drafting_mask_embedding()
+        print(
+            "KZ_LOAD_DIAG drafter_share_done "
+            f"class={type(self).__name__} method={self.method}",
+            flush=True,
+        )
 
         if (
             self.parallel_drafting
@@ -1820,7 +2304,12 @@ class SpecDecodeBaseProposer:
         ), "All drafting layers should belong to the same kv cache group"
 
     def allow_multiple_draft_kv_cache_groups(self) -> bool:
-        return False
+        # GLM/DeepSeek-style MTP can have separate draft attention and indexer
+        # cache groups when the target cache is DCP-sharded but the MTP draft
+        # cache is replicated locally (VLLM_DCP_SHARD_DRAFT=0). The proposer
+        # already builds per-group metadata for every draft attention group, so
+        # keep the single-group invariant only for other speculative methods.
+        return self.method == "mtp"
 
     def initialize_attn_backend(
         self,
@@ -1852,6 +2341,16 @@ class SpecDecodeBaseProposer:
         self._draft_kv_cache_group_ids = sorted(
             set(self._draft_layer_to_kv_cache_gid.values())
         )
+        self._draft_kv_cache_group_dcp_replicated = {
+            gid: bool(
+                getattr(
+                    kv_cache_config.kv_cache_groups[gid].kv_cache_spec,
+                    "dcp_replicated",
+                    False,
+                )
+            )
+            for gid in self._draft_kv_cache_group_ids
+        }
         if not self.allow_multiple_draft_kv_cache_groups():
             assert len(self._draft_kv_cache_group_ids) == 1, (
                 "All drafting layers should belong to the same kv cache group"

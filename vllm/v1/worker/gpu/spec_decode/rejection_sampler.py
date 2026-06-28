@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
 from vllm.config import SpeculativeConfig
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
@@ -18,6 +21,8 @@ from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -63,6 +68,25 @@ class RejectionSampler:
         self.sampler = sampler
         self.num_speculative_steps = spec_config.num_speculative_tokens
         self.rejection_sample_method = spec_config.rejection_sample_method
+        self._mtp_diag_enabled = os.getenv("VLLM_MTP_DCP_DIAG", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ) or os.getenv("KZ_MTP_REJECT_DIAG", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._mtp_diag_remaining = int(
+            os.getenv("VLLM_MTP_DCP_DIAG_LIMIT", "0") or "0"
+        )
+        if self._mtp_diag_enabled and self._mtp_diag_remaining <= 0:
+            self._mtp_diag_remaining = 6
+        self._mtp_diag_tokens = int(
+            os.getenv("VLLM_MTP_DCP_DIAG_TOKENS", "8") or "8"
+        )
         self.synthetic_conditional_rates: torch.Tensor | None = None
         if self.rejection_sample_method == "synthetic":
             assert spec_config.synthetic_acceptance_rates is not None
@@ -73,6 +97,98 @@ class RejectionSampler:
                 dtype=torch.float32,
                 device=device,
             )
+
+    def _mtp_diag_rank_info(self) -> dict[str, int | None]:
+        info: dict[str, int | None] = {
+            "rank": None,
+            "tp_rank": None,
+            "dcp_rank": None,
+        }
+        try:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                info["rank"] = torch.distributed.get_rank()
+        except Exception:
+            pass
+        try:
+            from vllm.distributed.parallel_state import get_tp_group
+
+            info["tp_rank"] = get_tp_group().rank_in_group
+        except Exception:
+            pass
+        try:
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            info["dcp_rank"] = get_dcp_group().rank_in_group
+        except Exception:
+            pass
+        return info
+
+    def _mtp_diag_preview(self, value: torch.Tensor | None) -> object:
+        if value is None:
+            return None
+        try:
+            return (
+                value.detach()
+                .flatten()[: self._mtp_diag_tokens]
+                .to(device="cpu")
+                .tolist()
+            )
+        except Exception as exc:
+            return f"<unavailable:{type(exc).__name__}:{exc}>"
+
+    def _mtp_diag_shape(self, value: torch.Tensor | None) -> object:
+        if value is None:
+            return None
+        try:
+            return tuple(value.shape)
+        except Exception:
+            return None
+
+    def _mtp_diag_log(
+        self,
+        *,
+        sampled: torch.Tensor,
+        raw_num_sampled: torch.Tensor,
+        adjusted_num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        draft_sampled: torch.Tensor,
+        pos: torch.Tensor,
+        input_batch: InputBatch,
+        draft_logits: torch.Tensor | None,
+        logits: torch.Tensor,
+    ) -> None:
+        if not self._mtp_diag_enabled or self._mtp_diag_remaining <= 0:
+            return
+        self._mtp_diag_remaining -= 1
+        rank_info = self._mtp_diag_rank_info()
+        logger.warning(
+            "KZ_MTP_REJECT_DIAG "
+            "rank=%s tp_rank=%s dcp_rank=%s "
+            "num_speculative_steps=%s rejection_method=%s "
+            "logits_shape=%s draft_logits_shape=%s "
+            "cu_num_logits=%s idx_mapping=%s expanded_idx_mapping=%s "
+            "seq_lens=%s prefill_len=%s "
+            "pos=%s draft_sampled=%s sampled=%s "
+            "raw_num_sampled=%s adjusted_num_sampled=%s num_rejected=%s",
+            rank_info["rank"],
+            rank_info["tp_rank"],
+            rank_info["dcp_rank"],
+            self.num_speculative_steps,
+            self.rejection_sample_method,
+            self._mtp_diag_shape(logits),
+            self._mtp_diag_shape(draft_logits),
+            self._mtp_diag_preview(input_batch.cu_num_logits),
+            self._mtp_diag_preview(input_batch.idx_mapping),
+            self._mtp_diag_preview(input_batch.expanded_idx_mapping),
+            self._mtp_diag_preview(input_batch.seq_lens),
+            self._mtp_diag_preview(self.sampler.req_states.prefill_len.gpu),
+            self._mtp_diag_preview(pos),
+            self._mtp_diag_preview(draft_sampled),
+            self._mtp_diag_preview(sampled),
+            self._mtp_diag_preview(raw_num_sampled),
+            self._mtp_diag_preview(adjusted_num_sampled),
+            self._mtp_diag_preview(num_rejected),
+        )
 
     def _get_logprobs_tensors(
         self,
@@ -145,6 +261,7 @@ class RejectionSampler:
             self.synthetic_conditional_rates,
             use_fp64=self.sampler.use_fp64_gumbel,
         )
+        raw_num_sampled = num_sampled.detach().clone()
         logprobs_tensors = self._get_logprobs_tensors(
             input_batch,
             sampled,
@@ -160,6 +277,17 @@ class RejectionSampler:
             input_batch.cu_num_logits,
             input_batch.idx_mapping,
             self.sampler.req_states.prefill_len.gpu,
+        )
+        self._mtp_diag_log(
+            sampled=sampled,
+            raw_num_sampled=raw_num_sampled,
+            adjusted_num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            draft_sampled=draft_sampled,
+            pos=pos,
+            input_batch=input_batch,
+            draft_logits=draft_logits,
+            logits=logits,
         )
 
         return SamplerOutput(

@@ -331,6 +331,9 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
         self.cp_kv_cache_interleave_size = (
             vllm_config.parallel_config.cp_kv_cache_interleave_size
         )
+        self.use_exact_seq_lens = (
+            os.environ.get("VLLM_B12X_MLA_EXACT_SEQ_LENS", "0") == "1"
+        )
 
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         max_seqs = vllm_config.scheduler_config.max_num_seqs
@@ -412,11 +415,12 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             # it. The per-token context length only feeds cache_seq_lens_per_token,
             # which forward_mqa clamps via torch.minimum(nsa, per_token_cache) and
             # the kernel masks past nsa_len, so an optimistic (>=) bound is safe.
-            seq_lens_cpu_src = (
-                cm.seq_lens_cpu_upper_bound
-                if cm.seq_lens_cpu_upper_bound is not None
-                else cm.seq_lens_cpu
-            )
+            seq_lens_cpu_src = cm.seq_lens_cpu
+            if (
+                not self.use_exact_seq_lens
+                and cm.seq_lens_cpu_upper_bound is not None
+            ):
+                seq_lens_cpu_src = cm.seq_lens_cpu_upper_bound
             seq_lens_cpu = seq_lens_cpu_src.numpy().astype(np.int32, copy=False)
             per_token_lens = np.zeros((num_tokens,), dtype=np.int32)
             for req_id, q_len in enumerate(query_lens):

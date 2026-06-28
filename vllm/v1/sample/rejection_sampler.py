@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -10,6 +11,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
+from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
@@ -84,6 +86,218 @@ class RejectionSampler(nn.Module):
                 device=device,
             )
         self.synthetic_mode = self.synthetic_conditional_rates is not None
+        self._mtp_dcp_diag_enabled = os.environ.get("VLLM_MTP_DCP_DIAG", "0") == "1"
+        self._mtp_dcp_diag_limit = int(os.environ.get("VLLM_MTP_DCP_DIAG_LIMIT", "8"))
+        self._mtp_dcp_diag_tokens = int(os.environ.get("VLLM_MTP_DCP_DIAG_TOKENS", "8"))
+        self._mtp_dcp_diag_cycle = 0
+        self._dcp_sync_rejection_output = (
+            os.environ.get("VLLM_DCP_SYNC_REJECTION_OUTPUT", "0") == "1"
+        )
+
+    @staticmethod
+    def _diag_rank_info() -> tuple[int, int]:
+        rank = -1
+        dcp_rank = -1
+        try:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+        except Exception:
+            rank = -1
+        try:
+            dcp_rank = get_dcp_group().rank_in_group
+        except Exception:
+            dcp_rank = -1
+        return rank, dcp_rank
+
+    @staticmethod
+    def _diag_tensor_head(
+        tensor: torch.Tensor | None,
+        limit: int,
+    ) -> list[int] | None:
+        if tensor is None:
+            return None
+        try:
+            view = tensor.detach().reshape(-1)[:limit]
+            return [int(x) for x in view.cpu().tolist()]
+        except Exception:
+            return None
+
+    @staticmethod
+    def _diag_float_tensor_head(
+        tensor: torch.Tensor | None,
+        limit: int,
+    ) -> list[float] | None:
+        if tensor is None:
+            return None
+        try:
+            view = tensor.detach().reshape(-1)[:limit]
+            return [round(float(x), 6) for x in view.cpu().tolist()]
+        except Exception:
+            return None
+
+    @staticmethod
+    def _diag_draft_row_fields(
+        num_draft_tokens: list[int],
+        limit: int,
+    ) -> tuple[list[int], list[int]]:
+        req_indices: list[int] = []
+        draft_positions: list[int] = []
+        for req_idx, num_tokens in enumerate(num_draft_tokens):
+            for draft_pos in range(num_tokens):
+                req_indices.append(req_idx)
+                draft_positions.append(draft_pos)
+                if len(req_indices) >= limit:
+                    return req_indices, draft_positions
+        return req_indices, draft_positions
+
+    @staticmethod
+    def _diag_topk_prob_heads(
+        probs: torch.Tensor | None,
+        limit: int,
+        k: int = 3,
+    ) -> tuple[list[list[int]] | None, list[list[float]] | None]:
+        if probs is None:
+            return None, None
+        try:
+            rows = probs.detach()[:limit].to(torch.float32)
+            topk = min(k, rows.shape[-1])
+            values, indices = torch.topk(rows, k=topk, dim=-1)
+            return (
+                [[int(x) for x in row] for row in indices.cpu().tolist()],
+                [
+                    [round(float(x), 6) for x in row]
+                    for row in values.cpu().tolist()
+                ],
+            )
+        except Exception:
+            return None, None
+
+    def _log_mtp_probability_diag(
+        self,
+        metadata: SpecDecodeMetadata,
+        draft_probs: torch.Tensor | None,
+        target_logits: torch.Tensor,
+    ) -> None:
+        if not self._mtp_dcp_diag_enabled:
+            return
+        if self._mtp_dcp_diag_cycle >= self._mtp_dcp_diag_limit:
+            return
+        if metadata.draft_token_ids.numel() == 0:
+            return
+
+        limit = self._mtp_dcp_diag_tokens
+        rank, dcp_rank = self._diag_rank_info()
+        draft_token_ids = metadata.draft_token_ids.to(torch.long)
+        target_logits_indices = metadata.target_logits_indices.to(torch.long)
+        logits_indices = metadata.logits_indices.to(torch.long)
+        draft_source_indices = None
+        target_source_indices = None
+        source_index_delta = None
+        try:
+            target_source_indices = logits_indices[target_logits_indices]
+            draft_source_indices = logits_indices[target_logits_indices + 1]
+            source_index_delta = draft_source_indices - target_source_indices
+        except Exception:
+            target_source_indices = None
+            draft_source_indices = None
+            source_index_delta = None
+        req_indices, draft_positions = self._diag_draft_row_fields(
+            metadata.num_draft_tokens,
+            limit,
+        )
+        rows = torch.arange(
+            draft_token_ids.shape[0],
+            device=target_logits.device,
+            dtype=torch.long,
+        )
+        target_log_probs = target_logits.log_softmax(dim=-1)
+        target_probs_for_draft = target_log_probs[rows, draft_token_ids].exp()
+        target_top_log_probs, target_top_ids = torch.topk(
+            target_log_probs,
+            k=min(3, target_log_probs.shape[-1]),
+            dim=-1,
+        )
+        target_argmax_ids = target_top_ids[:, 0]
+        target_argmax_match = target_argmax_ids == draft_token_ids
+        draft_probs_for_draft = None
+        draft_top_ids = None
+        draft_top_probs = None
+        accept_probs = target_probs_for_draft
+        if draft_probs is not None:
+            draft_probs_for_draft = draft_probs[rows, draft_token_ids].to(torch.float32)
+            draft_top_ids, draft_top_probs = self._diag_topk_prob_heads(
+                draft_probs,
+                limit,
+            )
+            accept_probs = torch.minimum(
+                target_probs_for_draft / draft_probs_for_draft.clamp_min(1e-20),
+                torch.ones_like(target_probs_for_draft),
+            )
+        logger.warning(
+            "KZ_MTP_PROB_DIAG cycle=%s rank=%s dcp_rank=%s "
+            "num_draft_tokens=%s req_idx=%s draft_pos=%s "
+            "target_logits_idx=%s target_src_idx=%s draft_src_idx=%s "
+            "src_delta=%s bonus_logits_idx=%s logits_idx=%s "
+            "draft_head=%s target_p=%s draft_p=%s accept_p=%s "
+            "target_argmax=%s target_argmax_match=%s "
+            "target_top_ids=%s target_top_p=%s draft_top_ids=%s "
+            "draft_top_p=%s",
+            self._mtp_dcp_diag_cycle,
+            rank,
+            dcp_rank,
+            metadata.num_draft_tokens,
+            req_indices,
+            draft_positions,
+            self._diag_tensor_head(target_logits_indices, limit),
+            self._diag_tensor_head(target_source_indices, limit),
+            self._diag_tensor_head(draft_source_indices, limit),
+            self._diag_tensor_head(source_index_delta, limit),
+            self._diag_tensor_head(metadata.bonus_logits_indices, limit),
+            self._diag_tensor_head(logits_indices, limit + len(metadata.num_draft_tokens)),
+            self._diag_tensor_head(metadata.draft_token_ids, limit),
+            self._diag_float_tensor_head(target_probs_for_draft, limit),
+            self._diag_float_tensor_head(draft_probs_for_draft, limit),
+            self._diag_float_tensor_head(accept_probs, limit),
+            self._diag_tensor_head(target_argmax_ids, limit),
+            self._diag_tensor_head(target_argmax_match.to(torch.int32), limit),
+            self._diag_tensor_head(target_top_ids, limit * 3),
+            self._diag_float_tensor_head(target_top_log_probs.exp(), limit * 3),
+            draft_top_ids,
+            draft_top_probs,
+        )
+
+    def _log_mtp_rejection_diag(
+        self,
+        metadata: SpecDecodeMetadata,
+        output_token_ids: torch.Tensor,
+    ) -> None:
+        if not self._mtp_dcp_diag_enabled:
+            return
+        if self._mtp_dcp_diag_cycle >= self._mtp_dcp_diag_limit:
+            return
+
+        rank, dcp_rank = self._diag_rank_info()
+        # All non-placeholder ids emitted by rejection_sample are valid token ids
+        # for the acceptance-length question. Valid sampled count includes the
+        # recovered/bonus token, so accepted draft count is count - 1.
+        valid_counts = (output_token_ids != PLACEHOLDER_TOKEN_ID).sum(dim=1)
+        accepted_draft_counts = torch.clamp(valid_counts - 1, min=0)
+        limit = self._mtp_dcp_diag_tokens
+        logger.warning(
+            "KZ_MTP_REJECT_DIAG cycle=%s rank=%s dcp_rank=%s "
+            "num_draft_tokens=%s draft_head=%s output_head=%s "
+            "valid_counts=%s accepted_draft_counts=%s synthetic=%s",
+            self._mtp_dcp_diag_cycle,
+            rank,
+            dcp_rank,
+            metadata.num_draft_tokens,
+            self._diag_tensor_head(metadata.draft_token_ids, limit),
+            self._diag_tensor_head(output_token_ids, limit),
+            self._diag_tensor_head(valid_counts, limit),
+            self._diag_tensor_head(accepted_draft_counts, limit),
+            self.synthetic_mode,
+        )
+        self._mtp_dcp_diag_cycle += 1
 
     def forward(
         self,
@@ -179,6 +393,18 @@ class RejectionSampler(nn.Module):
             synthetic_conditional_rates=self.synthetic_conditional_rates,
             use_fp64_gumbel=self.use_fp64_gumbel,
         )
+        if self._dcp_sync_rejection_output:
+            try:
+                dcp_group = get_dcp_group()
+                if dcp_group.world_size > 1:
+                    output_token_ids = dcp_group.broadcast(output_token_ids, src=0)
+            except Exception:
+                logger.exception(
+                    "Failed to synchronize rejection sampler output across DCP ranks"
+                )
+                raise
+        self._log_mtp_probability_diag(metadata, draft_probs, target_logits)
+        self._log_mtp_rejection_diag(metadata, output_token_ids)
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:

@@ -2526,7 +2526,9 @@ class GPUModelRunner(
                 else:
                     spec_decode_common_attn_metadata = cm
             # Capture per-group block tables for multi-group proposers.
-            if self.speculative_config and isinstance(self.drafter, Step3p5MTPProposer):
+            if self.speculative_config and hasattr(
+                self.drafter, "set_per_group_attn_metadata"
+            ):
                 self.drafter.set_per_group_attn_metadata(
                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping
                 )
@@ -5215,6 +5217,12 @@ class GPUModelRunner(
         Args:
             load_dummy_weights: load dummy weights instead of real weights.
         """
+        rank = getattr(self, "rank", getattr(self, "rank_in_group", "unknown"))
+        print(
+            "KZ_LOAD_DIAG runner_load_model_enter "
+            f"rank={rank} device={self.device}",
+            flush=True,
+        )
         logger.info_once(
             "Starting to load model %s...",
             self.model_config.model,
@@ -5231,8 +5239,18 @@ class GPUModelRunner(
                 if load_dummy_weights:
                     self.load_config.load_format = "dummy"
                 model_loader = get_model_loader(self.load_config)
+                print(
+                    "KZ_LOAD_DIAG runner_target_load_start "
+                    f"rank={rank}",
+                    flush=True,
+                )
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config, model_config=self.model_config
+                )
+                print(
+                    "KZ_LOAD_DIAG runner_target_load_done "
+                    f"rank={rank}",
+                    flush=True,
                 )
                 if self.lora_config:
                     self.model = self.load_lora_model(
@@ -5240,8 +5258,18 @@ class GPUModelRunner(
                     )
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
+                    print(
+                        "KZ_LOAD_DIAG runner_drafter_load_start "
+                        f"rank={rank} drafter={type(self.drafter).__name__}",
+                        flush=True,
+                    )
                     if hasattr(self.drafter, "load_model"):
                         self.drafter.load_model(self.model)
+                    print(
+                        "KZ_LOAD_DIAG runner_drafter_load_done "
+                        f"rank={rank} drafter={type(self.drafter).__name__}",
+                        flush=True,
+                    )
                     if (
                         hasattr(self.drafter, "model")
                         and is_mixture_of_experts(self.drafter.model)
@@ -5268,6 +5296,11 @@ class GPUModelRunner(
                         eplb_models += 1
 
                 self._setup_eagle3_aux_hidden_state_outputs()
+                print(
+                    "KZ_LOAD_DIAG runner_post_drafter_setup_done "
+                    f"rank={rank}",
+                    flush=True,
+                )
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the
