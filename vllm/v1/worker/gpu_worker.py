@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A GPU worker class."""
 
+import ctypes
 import gc
 import os
 from collections.abc import Callable
@@ -79,6 +80,28 @@ from .gpu.warmup import warmup_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
+
+
+def _trim_after_model_load_if_enabled() -> None:
+    if os.getenv("VLLM_KZ_TRIM_AFTER_LOAD", "0") != "1":
+        return
+
+    gc.collect()
+    torch.accelerator.empty_cache()
+
+    malloc_trim_result: int | str = "not_run"
+    try:
+        malloc_trim_result = ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception as exc:
+        malloc_trim_result = f"failed:{exc}"
+
+    logger.info(
+        "VLLM_KZ_TRIM_AFTER_LOAD completed host=%s pid=%s malloc_trim=%s",
+        os.uname().nodename,
+        os.getpid(),
+        malloc_trim_result,
+    )
+
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -392,6 +415,8 @@ class Worker(WorkerBase):
                 self.vllm_config.parallel_config,
                 self.model_runner.get_model(),
             )
+
+        _trim_after_model_load_if_enabled()
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
