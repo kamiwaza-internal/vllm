@@ -17,7 +17,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     replace,
 )
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -59,6 +59,7 @@ from vllm.v1.spec_decode.utils import (
 )
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
+from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -175,6 +176,11 @@ class SpecDecodeBaseProposer:
         # persistent buffers for cuda graph
         self.input_ids = torch.zeros(
             self.max_num_tokens, dtype=torch.int32, device=device
+        )
+        self._draft_dcp_local_seq_lens = torch.zeros(
+            max(self.max_batch_size, self.max_num_tokens),
+            dtype=torch.int32,
+            device=device,
         )
         # Use draft model's M-RoPE setting, not target model's
         # Draft models may be text-only even if target is multimodal
@@ -1049,11 +1055,49 @@ class SpecDecodeBaseProposer:
     def build_per_group_and_layer_attn_metadata(
         self, common_attn_metadata: CommonAttentionMetadata, draft_index: int = 0
     ) -> tuple[list[object], dict[str, object]]:
+        parallel_config = self.speculative_config.draft_parallel_config
+        if self._dcp_shard_draft_enabled():
+            parallel_config = self.vllm_config.parallel_config
+        dcp_size = parallel_config.decode_context_parallel_size
+        dcp_local_seq_lens = None
+        if dcp_size > 1:
+            assert (
+                common_attn_metadata.num_reqs
+                <= common_attn_metadata.seq_lens.shape[0]
+                <= self._draft_dcp_local_seq_lens.shape[0]
+            ), "Draft DCP request padding exceeds the persistent buffer capacity."
+            dcp_group = get_dcp_group()
+            assert dcp_group.world_size == dcp_size, (
+                "Draft DCP configuration does not match its communication group."
+            )
+            # Rejections and each appended draft token update global lengths.
+            # Refresh into proposer-owned storage before any builder consumes
+            # local bounds; do not mutate the target runner's shared buffer.
+            prepare_dcp_local_seq_lens(
+                self._draft_dcp_local_seq_lens,
+                common_attn_metadata.seq_lens,
+                common_attn_metadata.num_reqs,
+                dcp_size,
+                dcp_group.rank_in_group,
+                parallel_config.cp_kv_cache_interleave_size,
+            )
+            dcp_local_seq_lens = self._draft_dcp_local_seq_lens[
+                : common_attn_metadata.seq_lens.shape[0]
+            ]
         per_group_attn_metadata: list[object] = []
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
+            group_common_metadata = dataclasses.replace(
+                common_attn_metadata,
+                dcp_local_seq_lens=(
+                    None
+                    if getattr(attn_group.kv_cache_spec, "dcp_replicated", False)
+                    else dcp_local_seq_lens
+                ),
+                dcp_local_seq_lens_cpu=None,
+            )
             attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
-                common_attn_metadata=common_attn_metadata, draft_index=draft_index
+                common_attn_metadata=group_common_metadata, draft_index=draft_index
             )
             per_group_attn_metadata.append(attn_metadata)
             for layer_name in attn_group.layer_names:
@@ -1329,6 +1373,14 @@ class SpecDecodeBaseProposer:
             model = model.module
         return model.__class__.__name__
 
+    def _dcp_shard_draft_enabled(self) -> bool:
+        default = "1" if self.speculative_config.method == "mtp" else "0"
+        return os.environ.get("VLLM_DCP_SHARD_DRAFT", default).lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
     def _create_draft_vllm_config(self) -> VllmConfig:
         """Return a VllmConfig with kernel-level overrides for the proposer.
         Subclasses may override to apply additional config changes.
@@ -1342,12 +1394,7 @@ class SpecDecodeBaseProposer:
         # runner path (gpu/spec_decode/eagle/utils.py) restores the target
         # DCP for native MTP drafts; mirror that here for the V1 path and
         # retain the target cache interleave and DCP communication mode.
-        import os as _os
-
-        default_shard_draft = "1" if spec_cfg.method == "mtp" else "0"
-        if _os.environ.get(
-            "VLLM_DCP_SHARD_DRAFT", default_shard_draft
-        ).lower() in ("1", "true", "yes"):
+        if self._dcp_shard_draft_enabled():
             draft_parallel_config = replace(
                 draft_parallel_config,
                 decode_context_parallel_size=(

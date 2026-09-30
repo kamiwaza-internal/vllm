@@ -7,6 +7,7 @@ on:
     paths:
       - vllm/model_executor/layers/sparse_attn_indexer.py
       - vllm/model_executor/models/deepseek_mtp.py
+      - vllm/model_executor/models/glm4_moe_lite.py
       - vllm/v1/attention/backends/mla/indexer.py
       - vllm/v1/spec_decode/llm_base_proposer.py
       - .github/workflows/v1-mtp-source-checks.yml
@@ -45,6 +46,7 @@ jobs:
           files=(
             vllm/model_executor/layers/sparse_attn_indexer.py
             vllm/model_executor/models/deepseek_mtp.py
+            vllm/model_executor/models/glm4_moe_lite.py
             vllm/v1/attention/backends/mla/indexer.py
             vllm/v1/spec_decode/llm_base_proposer.py
           )
@@ -59,7 +61,7 @@ jobs:
           {
             echo '## V1 MTP source checks'
             echo "Head: $GITHUB_SHA"
-            echo 'Runs upstream lint, syntax and source-policy checks on the four changed Python modules.'
+            echo 'Runs upstream lint, syntax and source-policy checks on the authored modules and restored MTP module.'
             echo 'Does not import or execute CUDA kernels, native MTP, GLM/B12X, or TP4/DCP4 inference.'
             echo 'Native qualification and upstream maintainer CI admission remain separate requirements.'
           } >> "$GITHUB_STEP_SUMMARY"

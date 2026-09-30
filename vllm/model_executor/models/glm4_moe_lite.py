@@ -46,6 +46,7 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.sparse_attn_indexer import use_b12x_sparse_indexer
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -106,6 +107,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         prefix: str,
         config: "Glm4MoeLiteConfig | None" = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        topk_scores_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
 
@@ -149,6 +151,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
             topk_indices_buffer=topk_indices_buffer,
+            topk_scores_buffer=topk_scores_buffer,
         )
 
         if (
@@ -229,8 +232,22 @@ class Glm4MoeLiteModel(nn.Module):
                 dtype=torch.int32,
                 device=self.device,
             )
+            topk_scores_buffer = None
+            if (
+                vllm_config.parallel_config.decode_context_parallel_size > 1
+                and use_b12x_sparse_indexer()
+            ):
+                # Layers share serial index scratch; pair scores at this owner
+                # so the indexer fallback does not allocate once per layer.
+                topk_scores_buffer = torch.empty(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    topk_tokens,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
         else:
             topk_indices_buffer = None
+            topk_scores_buffer = None
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -249,6 +266,7 @@ class Glm4MoeLiteModel(nn.Module):
                 config=config,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
+                topk_scores_buffer=topk_scores_buffer,
             ),
             prefix=f"{prefix}.layers",
         )
