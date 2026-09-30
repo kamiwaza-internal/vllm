@@ -670,7 +670,9 @@ class SpecDecodeBaseProposer:
                             "sample_hidden_states": (
                                 sample_hidden_states.detach().to(torch.float32).cpu()
                             ),
-                            "draft_logits": draft_logits.detach().to(torch.float32).cpu(),
+                            "draft_logits": (
+                                draft_logits.detach().to(torch.float32).cpu()
+                            ),
                             "draft_topk_indices": topk_indices.detach().cpu(),
                             "draft_topk_values": (
                                 topk_values.detach().to(torch.float32).cpu()

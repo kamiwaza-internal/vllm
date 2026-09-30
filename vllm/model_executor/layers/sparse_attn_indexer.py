@@ -433,7 +433,7 @@ def _get_dcp_warmup_params() -> tuple[int, int, int]:
 def _sync_dcp_warmup() -> None:
     """Finish one-time DCP warmup on every rank before graph warmup proceeds."""
     if current_platform.is_cuda():
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
     try:
         from vllm.distributed.parallel_state import get_dcp_group
@@ -446,7 +446,7 @@ def _sync_dcp_warmup() -> None:
         return
     finally:
         if current_platform.is_cuda():
-            torch.cuda.synchronize()
+            current_platform.synchronize()
 
 
 def _prewarm_b12x_dcp_topk_merge(

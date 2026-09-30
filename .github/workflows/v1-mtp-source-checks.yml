@@ -1,0 +1,65 @@
+name: V1 MTP source checks (no GPU qualification)
+
+on:
+  push:
+    branches: [fix/v1-draft-dcp-parallel-config]
+  pull_request:
+    paths:
+      - vllm/model_executor/layers/sparse_attn_indexer.py
+      - vllm/model_executor/models/deepseek_mtp.py
+      - vllm/v1/attention/backends/mla/indexer.py
+      - vllm/v1/spec_decode/llm_base_proposer.py
+      - .github/workflows/v1-mtp-source-checks.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v1-mtp-source-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-checks:
+    # This is source-fork evidence; upstream's CI admission is unchanged.
+    if: github.repository == 'kamiwaza-internal/vllm'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      OMP_NUM_THREADS: '2'
+      OPENBLAS_NUM_THREADS: '2'
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: '3.12'
+      - name: Install source-check tools
+        run: |
+          pipx install uv==0.11.1
+          uv venv --python 3.12
+          uv pip install --python .venv/bin/python ruff==0.14.0 regex
+      - name: Check the changed Python modules with upstream tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PYTHONPYCACHEPREFIX="$RUNNER_TEMP/v1-mtp-bytecode"
+          files=(
+            vllm/model_executor/layers/sparse_attn_indexer.py
+            vllm/model_executor/models/deepseek_mtp.py
+            vllm/v1/attention/backends/mla/indexer.py
+            vllm/v1/spec_decode/llm_base_proposer.py
+          )
+          .venv/bin/python -m ruff check "${files[@]}"
+          .venv/bin/python -m py_compile "${files[@]}"
+          for checker in check_spdx_header check_forbidden_imports check_torch_cuda check_boolean_context_manager; do
+            .venv/bin/python "tools/pre_commit/${checker}.py" "${files[@]}"
+          done
+          git diff --exit-code
+      - name: Record coverage scope
+        run: |
+          {
+            echo '## V1 MTP source checks'
+            echo "Head: $GITHUB_SHA"
+            echo 'Runs upstream lint, syntax and source-policy checks on the four changed Python modules.'
+            echo 'Does not import or execute CUDA kernels, native MTP, GLM/B12X, or TP4/DCP4 inference.'
+            echo 'Native qualification and upstream maintainer CI admission remain separate requirements.'
+          } >> "$GITHUB_STEP_SUMMARY"
