@@ -1340,7 +1340,8 @@ class SpecDecodeBaseProposer:
         # attention silently runs with dcp=1 (no q-allgather, no LSE merge)
         # while its KV/metadata use DCP-local sharded semantics. The V2
         # runner path (gpu/spec_decode/eagle/utils.py) restores the target
-        # DCP for native MTP drafts; mirror that here for the V1 path.
+        # DCP for native MTP drafts; mirror that here for the V1 path and
+        # retain the target cache interleave and DCP communication mode.
         import os as _os
 
         default_shard_draft = "1" if spec_cfg.method == "mtp" else "0"
@@ -1352,6 +1353,10 @@ class SpecDecodeBaseProposer:
                 decode_context_parallel_size=(
                     self.vllm_config.parallel_config.decode_context_parallel_size
                 ),
+                cp_kv_cache_interleave_size=(
+                    self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+                ),
+                dcp_comm_backend=self.vllm_config.parallel_config.dcp_comm_backend,
             )
         config = replace(
             self.vllm_config,

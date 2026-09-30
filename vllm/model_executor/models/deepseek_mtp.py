@@ -24,6 +24,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     scaled_dequantize,
 )
+from vllm.model_executor.layers.sparse_attn_indexer import use_b12x_sparse_indexer
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -345,7 +346,10 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
                 device=self.device,
             )
             topk_scores_buffer = None
-            if vllm_config.parallel_config.decode_context_parallel_size > 1:
+            if (
+                vllm_config.parallel_config.decode_context_parallel_size > 1
+                and use_b12x_sparse_indexer()
+            ):
                 topk_scores_buffer = torch.empty(
                     vllm_config.scheduler_config.max_num_batched_tokens,
                     topk_tokens,
