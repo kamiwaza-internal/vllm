@@ -161,6 +161,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        topk_scores_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.vllm_config = vllm_config
@@ -289,6 +290,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 compress_ratio=self.compress_ratio,
                 prefix=f"{prefix}.indexer",
                 aux_stream=indexer_aux_stream,
+                topk_scores_buffer=topk_scores_buffer,
             )
 
         # Will be None on ROCm for now.
@@ -967,6 +969,7 @@ class DeepseekV4Indexer(nn.Module):
         compress_ratio: int = 1,
         prefix: str = "",
         aux_stream: torch.cuda.Stream | None = None,
+        topk_scores_buffer: torch.Tensor | None = None,
     ):
         super().__init__()
         self.vllm_config = vllm_config
@@ -1056,6 +1059,7 @@ class DeepseekV4Indexer(nn.Module):
             self.topk_indices_buffer,
             skip_k_cache_insert=True,
             use_fp4_cache=self.use_fp4_kv,
+            topk_scores_buffer=topk_scores_buffer,
         )
 
         # None on ROCm — maybe_execute_in_parallel falls back to sequential.

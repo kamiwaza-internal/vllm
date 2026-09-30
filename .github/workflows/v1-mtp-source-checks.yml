@@ -6,6 +6,10 @@ on:
   pull_request:
     paths:
       - vllm/model_executor/layers/sparse_attn_indexer.py
+      - vllm/model_executor/layers/attention/mla_attention.py
+      - vllm/models/deepseek_v4/attention.py
+      - vllm/models/deepseek_v4/nvidia/model.py
+      - vllm/models/deepseek_v4/nvidia/mtp.py
       - vllm/model_executor/models/deepseek_mtp.py
       - vllm/model_executor/models/glm4_moe_lite.py
       - vllm/v1/attention/backends/mla/indexer.py
@@ -45,6 +49,10 @@ jobs:
           export PYTHONPYCACHEPREFIX="$RUNNER_TEMP/v1-mtp-bytecode"
           files=(
             vllm/model_executor/layers/sparse_attn_indexer.py
+            vllm/model_executor/layers/attention/mla_attention.py
+            vllm/models/deepseek_v4/attention.py
+            vllm/models/deepseek_v4/nvidia/model.py
+            vllm/models/deepseek_v4/nvidia/mtp.py
             vllm/model_executor/models/deepseek_mtp.py
             vllm/model_executor/models/glm4_moe_lite.py
             vllm/v1/attention/backends/mla/indexer.py

@@ -15,6 +15,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.config.virtual_tp import VIRTUAL_TP_PLAN_ATTR
 from vllm.distributed import (
+    get_dcp_group,
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -47,6 +48,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.sparse_attn_indexer import use_b12x_sparse_indexer
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
@@ -848,6 +850,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        topk_scores_buffer: torch.Tensor | None = None,
     ):
         super().__init__()
 
@@ -872,6 +875,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
+            topk_scores_buffer=topk_scores_buffer,
         )
         self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
 
@@ -1422,6 +1426,11 @@ class DeepseekV4Model(nn.Module):
             config.index_topk,
             dtype=torch.int32,
         )
+        self.topk_scores_buffer = None
+        if get_dcp_group().world_size > 1 and use_b12x_sparse_indexer():
+            self.topk_scores_buffer = torch.empty_like(
+                self.topk_indices_buffer, dtype=torch.float32
+            )
         vocab_padding_size = _get_virtual_tp_vocab_padding_size(config)
 
         if get_pp_group().is_first_rank:
@@ -1441,6 +1450,7 @@ class DeepseekV4Model(nn.Module):
                 vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
+                topk_scores_buffer=self.topk_scores_buffer,
                 aux_stream_list=aux_stream_list,
             ),
             prefix=f"{prefix}.layers",

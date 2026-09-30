@@ -1055,9 +1055,9 @@ class SpecDecodeBaseProposer:
     def build_per_group_and_layer_attn_metadata(
         self, common_attn_metadata: CommonAttentionMetadata, draft_index: int = 0
     ) -> tuple[list[object], dict[str, object]]:
-        parallel_config = self.speculative_config.draft_parallel_config
-        if self._dcp_shard_draft_enabled():
-            parallel_config = self.vllm_config.parallel_config
+        # Builders use the target communication group and physical KV spec,
+        # including external drafts whose config opts out of DCP sharding.
+        parallel_config = self.vllm_config.parallel_config
         dcp_size = parallel_config.decode_context_parallel_size
         dcp_local_seq_lens = None
         if dcp_size > 1:
@@ -1068,7 +1068,7 @@ class SpecDecodeBaseProposer:
             ), "Draft DCP request padding exceeds the persistent buffer capacity."
             dcp_group = get_dcp_group()
             assert dcp_group.world_size == dcp_size, (
-                "Draft DCP configuration does not match its communication group."
+                "Target DCP configuration does not match its communication group."
             )
             # Rejections and each appended draft token update global lengths.
             # Refresh into proposer-owned storage before any builder consumes

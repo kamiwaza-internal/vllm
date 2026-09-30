@@ -20,6 +20,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.distributed import (
+    get_dcp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -34,6 +35,7 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.sparse_attn_indexer import use_b12x_sparse_indexer
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -72,6 +74,7 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         topk_indices_buffer: torch.Tensor,
         prefix: str,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        topk_scores_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
 
@@ -127,6 +130,7 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
             prefix,
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
+            topk_scores_buffer=topk_scores_buffer,
         )
 
     def forward(
@@ -192,6 +196,11 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
             topk_tokens,
             dtype=torch.int32,
         )
+        self.topk_scores_buffer = None
+        if get_dcp_group().world_size > 1 and use_b12x_sparse_indexer():
+            self.topk_scores_buffer = torch.empty_like(
+                self.topk_indices_buffer, dtype=torch.float32
+            )
 
         # Three aux streams shared across all MTP layers, mirroring DeepseekV4Model.
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
@@ -204,6 +213,7 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
                     self.topk_indices_buffer,
                     f"{prefix}.layers.{idx}",
                     aux_stream_list=aux_stream_list,
+                    topk_scores_buffer=self.topk_scores_buffer,
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,

@@ -409,6 +409,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.kv_b_proj = kv_b_proj
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.layer_name = prefix
+        self._dcp_replicated = False
         self.indexer = indexer
 
         self.num_kv_heads = 1
@@ -717,10 +718,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 return quant_output.fill_(0)
             return output.fill_(0)
 
-        if self.impl.dcp_world_size == -1:
-            dcp_group = get_dcp_group()
-            self.impl.dcp_world_size = dcp_group.world_size
-            self.impl.dcp_rank = dcp_group.rank_in_group
+        if self.impl.dcp_world_size == -1 or (
+            self._dcp_replicated and self.impl.dcp_world_size != 1
+        ):
+            if self._dcp_replicated:
+                self.impl.dcp_world_size = 1
+                self.impl.dcp_rank = 0
+            else:
+                dcp_group = get_dcp_group()
+                self.impl.dcp_world_size = dcp_group.world_size
+                self.impl.dcp_rank = dcp_group.rank_in_group
             self.impl.total_cp_world_size = (
                 self.impl.pcp_world_size * self.impl.dcp_world_size
             )
@@ -1094,6 +1101,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             and num_hidden_layers is not None
             and layer_id >= int(num_hidden_layers)
         )
+        # Dispatch must use the same physical layout as this layer's KV spec.
+        self._dcp_replicated = dcp_replicated
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
@@ -1631,6 +1640,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             self.dcp_rank = get_dcp_group().rank_in_group
         except AssertionError:
             # DCP might not be initialized in testing
+            self.dcp_world_size = 1
+            self.dcp_rank = 0
+        if kv_cache_spec.dcp_replicated:
             self.dcp_world_size = 1
             self.dcp_rank = 0
         self.dcp_local_block_size = parallel_config.cp_kv_cache_interleave_size
